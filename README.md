@@ -1,2 +1,2 @@
 # contract-examples
-a repository with code samples, program templates, and contracts for the octra network
+a repository containing examples of smart contracts, programs, and other examples written in Applied Meta Language (AppliedML or AML) and assembler for octa network with native support for HFHE encryption
