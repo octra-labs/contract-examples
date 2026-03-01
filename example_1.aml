@@ -1,0 +1,601 @@
+contract PrivateML {
+
+  enum ModelStatus { Draft, Active, Deprecated, Locked }
+  enum ProposalType { UpdateWeights, UpdateBias, SetThreshold, WithdrawFees }
+
+  enum VoteChoice { NoVote, Approve, Reject, Abstain }
+
+  struct Model {
+    num_features: int
+    bias: int
+    total_predictions: int
+    status: int
+    created_epoch: int
+    accuracy: int
+    version: int
+    fee_per_query: int
+  }
+
+  struct Proposal {
+    proposal_type: int
+    model_id: int
+    param_a: int
+    param_b: int
+    proposer: address
+    votes_for: int
+    votes_against: int
+    deadline: int
+    executed: int
+  }
+
+  struct UserProfile {
+    total_queries: int
+    total_spent: int
+    reputation: int
+    last_query_epoch: int
+  }
+
+  event ModelCreated(model_id: int, num_features: int, fee: int)
+  event ModelActivated(model_id: int, version: int)
+  event ModelDeprecated(model_id: int)
+  event WeightUpdated(model_id: int, feature: int, weight: int)
+  event Prediction(model_id: int, result: int, fee: int)
+  event PrivatePrediction(model_id: int, user: address)
+  event ProposalCreated(id: int, proposer: address, ptype: int)
+  event Voted(proposal_id: int, voter: address, choice: int)
+  event ProposalExecuted(proposal_id: int, ptype: int)
+  event Deposited(sender: address, amount: int)
+  event FeesWithdrawn(recipient: address, amount: int)
+  event WhitelistChanged(addr: address, allowed: int)
+  event ScoreStored(user: address, epoch_num: int)
+
+  const MAX_MODELS: int = 64
+  const MAX_FEATURES: int = 32
+  const FEE_DENOMINATOR: int = 10000
+  const DISCOUNT_RATE: int = 5000
+  const MIN_VOTING_PERIOD: int = 2
+  const MAX_VOTING_PERIOD: int = 100
+
+  state {
+    owner: address
+    name: string
+    version: int
+
+    models: map[int]Model
+    weights: map[int]map[int]int
+    model_count: int
+    active_model: int
+
+    users: map[address]UserProfile
+    user_count: int
+    whitelist: map[address]int
+    whitelist_enabled: int
+
+    proposals: map[int]Proposal
+    proposal_count: int
+    votes: map[int]map[address]int
+    governance_threshold: int
+
+    total_revenue: int
+    treasury: int
+    min_fee: int
+    fee_discount_threshold: int
+
+    encrypted_scores: map[address]string
+
+    total_predictions: int
+    total_private_predictions: int
+    epoch_queries: map[int]int
+  }
+
+  constructor(n: string, features: int) {
+    require(features > 0, "zero features")
+    require(features <= MAX_FEATURES, "too many features")
+    self.owner = origin
+    self.name = n
+    self.version = 1
+    self.model_count = 1
+    self.active_model = 0
+    self.governance_threshold = 1
+    self.min_fee = 0
+    self.fee_discount_threshold = 1000000000
+    self.whitelist_enabled = 0
+    self.models[0].num_features = features
+    self.models[0].bias = 0
+    self.models[0].total_predictions = 0
+    self.models[0].status = ModelStatus.Active
+    self.models[0].created_epoch = epoch
+    self.models[0].accuracy = 0
+    self.models[0].version = 1
+    self.models[0].fee_per_query = 0
+    emit ModelCreated(0, features, 0)
+  }
+
+  fn set_whitelist(enabled: int): bool {
+    require(caller == self.owner, "not owner")
+    self.whitelist_enabled = enabled
+    return true
+  }
+
+  fn add_to_whitelist(addr: address): bool {
+    require(caller == self.owner, "not owner")
+    self.whitelist[addr] = 1
+    emit WhitelistChanged(addr, 1)
+    return true
+  }
+
+  fn remove_from_whitelist(addr: address): bool {
+    require(caller == self.owner, "not owner")
+    self.whitelist[addr] = 0
+    emit WhitelistChanged(addr, 0)
+    return true
+  }
+
+  fn create_model(features: int, fee: int): int {
+    require(caller == self.owner, "not owner")
+    require(features > 0, "zero features")
+    require(features <= MAX_FEATURES, "too many features")
+    require(self.model_count < MAX_MODELS, "max models reached")
+    let id = self.model_count
+    self.models[id].num_features = features
+    self.models[id].bias = 0
+    self.models[id].total_predictions = 0
+    self.models[id].status = ModelStatus.Draft
+    self.models[id].created_epoch = epoch
+    self.models[id].accuracy = 0
+    self.models[id].version = 1
+    self.models[id].fee_per_query = fee
+    self.model_count += 1
+    emit ModelCreated(id, features, fee)
+    return id
+  }
+
+  fn activate_model(id: int): bool {
+    require(caller == self.owner, "not owner")
+    require(id >= 0, "invalid id")
+    require(id < self.model_count, "model not found")
+    let st = self.models[id].status
+    require(st == ModelStatus.Draft || st == ModelStatus.Deprecated, "cannot activate")
+    self.models[id].status = ModelStatus.Active
+    self.active_model = id
+    self.models[id].version += 1
+    emit ModelActivated(id, self.models[id].version)
+    return true
+  }
+
+  fn deprecate_model(id: int): bool {
+    require(caller == self.owner, "not owner")
+    require(id >= 0, "invalid id")
+    require(id < self.model_count, "model not found")
+    require(self.models[id].status == ModelStatus.Active, "not active")
+    self.models[id].status = ModelStatus.Deprecated
+    if self.active_model == id {
+      self.active_model = -1
+    }
+    emit ModelDeprecated(id)
+    return true
+  }
+
+  fn lock_model(id: int): bool {
+    require(caller == self.owner, "not owner")
+    require(id >= 0, "invalid id")
+    require(id < self.model_count, "model not found")
+    let st = self.models[id].status
+    require(st == ModelStatus.Active || st == ModelStatus.Deprecated, "cannot lock")
+    self.models[id].status = ModelStatus.Locked
+    return true
+  }
+
+  fn set_model_weight(model_id: int, idx: int, w: int): bool {
+    require(caller == self.owner, "not owner")
+    require(model_id >= 0, "invalid model")
+    require(model_id < self.model_count, "model not found")
+    require(self.models[model_id].status != ModelStatus.Locked, "model locked")
+    require(idx >= 0, "negative index")
+    require(idx < self.models[model_id].num_features, "index too large")
+    self.weights[model_id][idx] = w
+    emit WeightUpdated(model_id, idx, w)
+    return true
+  }
+
+  fn set_model_bias(model_id: int, b: int): bool {
+    require(caller == self.owner, "not owner")
+    require(model_id >= 0, "invalid model")
+    require(model_id < self.model_count, "model not found")
+    require(self.models[model_id].status != ModelStatus.Locked, "model locked")
+    self.models[model_id].bias = b
+    return true
+  }
+
+  fn batch_set_weights(model_id: int, csv: string): int {
+    require(caller == self.owner, "not owner")
+    require(model_id >= 0, "invalid model")
+    require(model_id < self.model_count, "model not found")
+    require(self.models[model_id].status != ModelStatus.Locked, "model locked")
+    let nf = self.models[model_id].num_features
+    let n = parse_ints(csv, 2000)
+    require(n <= nf, "too many weights")
+    for i in 0..n {
+      self.weights[model_id][i] = mget(2000 + i)
+    }
+    self.models[model_id].version += 1
+    return n
+  }
+
+  fn set_model_accuracy(model_id: int, acc: int): bool {
+    require(caller == self.owner, "not owner")
+    require(model_id >= 0, "invalid model")
+    require(model_id < self.model_count, "model not found")
+    require(acc >= 0, "negative accuracy")
+    require(acc <= FEE_DENOMINATOR, "accuracy > 100%")
+    self.models[model_id].accuracy = acc
+    return true
+  }
+
+  fn set_model_fee(model_id: int, fee: int): bool {
+    require(caller == self.owner, "not owner")
+    require(model_id >= 0, "invalid model")
+    require(model_id < self.model_count, "model not found")
+    require(fee >= 0, "negative fee")
+    self.models[model_id].fee_per_query = fee
+    return true
+  }
+
+  view fn predict_free(input: string): int {
+    let mid = self.active_model
+    require(mid >= 0, "no active model")
+    require(self.models[mid].status == ModelStatus.Active, "model not active")
+    let nf = self.models[mid].num_features
+    let n = parse_ints(input, 2000)
+    require(n <= nf, "too many features")
+    let sum = 0
+    for i in 0..n {
+      sum += self.weights[mid][i] * mget(2000 + i)
+    }
+    return sum + self.models[mid].bias
+  }
+
+  fn predict(model_id: int, input: string): int {
+    require(model_id >= 0, "invalid model")
+    require(model_id < self.model_count, "model not found")
+    require(self.models[model_id].status == ModelStatus.Active, "model not active")
+    if self.whitelist_enabled == 1 {
+      require(self.whitelist[caller] == 1, "not whitelisted")
+    }
+    let fee = self.models[model_id].fee_per_query
+    if fee > 0 {
+      let effective_fee = fee
+      if self.users[caller].total_spent >= self.fee_discount_threshold {
+        effective_fee = fee * DISCOUNT_RATE / FEE_DENOMINATOR
+      }
+      require(value >= effective_fee, "insufficient fee")
+      self.treasury += value
+      self.total_revenue += value
+      self.users[caller].total_spent += value
+    }
+    let nf = self.models[model_id].num_features
+    let n = parse_ints(input, 2000)
+    require(n <= nf, "too many features")
+    let sum = 0
+    for i in 0..n {
+      sum += self.weights[model_id][i] * mget(2000 + i)
+    }
+    let result = sum + self.models[model_id].bias
+    self.models[model_id].total_predictions += 1
+    self.total_predictions += 1
+    self.users[caller].total_queries += 1
+    self.users[caller].last_query_epoch = epoch
+    self.epoch_queries[epoch] += 1
+    emit Prediction(model_id, result, value)
+    return result
+  }
+
+  view fn private_predict(model_id: int, pk_addr: string, ct0: string, ct1: string): string {
+    require(model_id >= 0, "invalid model")
+    require(model_id < self.model_count, "model not found")
+    let pk = fhe_load_pk(pk_addr)
+    let c0 = fhe_deser(ct0)
+    let c1 = fhe_deser(ct1)
+    let s0 = fhe_scale(pk, c0, self.weights[model_id][0])
+    let s1 = fhe_scale(pk, c1, self.weights[model_id][1])
+    let sum = fhe_add(pk, s0, s1)
+    let result = fhe_add_const(pk, sum, self.models[model_id].bias)
+    return fhe_ser(result)
+  }
+
+  view fn private_predict_scaled(model_id: int, pk_addr: string, ct0: string, ct1: string, amplify: int, adjust: int): string {
+    require(model_id >= 0, "invalid model")
+    require(model_id < self.model_count, "model not found")
+    let pk = fhe_load_pk(pk_addr)
+    let c0 = fhe_deser(ct0)
+    let c1 = fhe_deser(ct1)
+    let s0 = fhe_scale(pk, c0, self.weights[model_id][0])
+    let s1 = fhe_scale(pk, c1, self.weights[model_id][1])
+    let dot = fhe_add(pk, s0, s1)
+    let biased = fhe_add_const(pk, dot, self.models[model_id].bias)
+    let scaled = fhe_scale(pk, biased, amplify)
+    let result = fhe_add_const(pk, scaled, adjust)
+    return fhe_ser(result)
+  }
+
+  view fn private_diff(model_id: int, pk_addr: string, ct0: string, ct1: string): string {
+    require(model_id >= 0, "invalid model")
+    require(model_id < self.model_count, "model not found")
+    let pk = fhe_load_pk(pk_addr)
+    let a = fhe_deser(ct0)
+    let b = fhe_deser(ct1)
+    let wa = fhe_scale(pk, a, self.weights[model_id][0])
+    let wb = fhe_scale(pk, b, self.weights[model_id][1])
+    let diff = fhe_sub(pk, wa, wb)
+    let result = fhe_add_const(pk, diff, self.models[model_id].bias)
+    return fhe_ser(result)
+  }
+
+  fn deposit(): bool {
+    require(value > 0, "zero deposit")
+    self.treasury += value
+    emit Deposited(caller, value)
+    return true
+  }
+
+  fn store_score(ct_score: string): bool {
+    self.encrypted_scores[caller] = ct_score
+    self.total_private_predictions += 1
+    self.users[caller].total_queries += 1
+    self.users[caller].last_query_epoch = epoch
+    emit ScoreStored(caller, epoch)
+    return true
+  }
+
+  view fn verify_score_zero(addr: string, proof: string): bool {
+    let pk = fhe_load_pk(addr)
+    let ct = fhe_deser(self.encrypted_scores[addr])
+    return fhe_verify_zero(pk, ct, proof)
+  }
+
+  fn create_proposal(ptype: int, model_id: int, param_a: int, param_b: int, duration: int): int {
+    require(duration >= MIN_VOTING_PERIOD, "duration too short")
+    require(duration <= MAX_VOTING_PERIOD, "duration too long")
+    require(ptype >= 0, "invalid type")
+    require(ptype <= 3, "invalid type")
+    let id = self.proposal_count
+    self.proposals[id].proposal_type = ptype
+    self.proposals[id].model_id = model_id
+    self.proposals[id].param_a = param_a
+    self.proposals[id].param_b = param_b
+    self.proposals[id].proposer = caller
+    self.proposals[id].votes_for = 0
+    self.proposals[id].votes_against = 0
+    self.proposals[id].deadline = epoch + duration
+    self.proposals[id].executed = 0
+    self.proposal_count += 1
+    emit ProposalCreated(id, caller, ptype)
+    return id
+  }
+
+  fn vote(proposal_id: int, choice: int): bool {
+    require(proposal_id >= 0, "invalid id")
+    require(proposal_id < self.proposal_count, "proposal not found")
+    require(self.proposals[proposal_id].executed == 0, "already executed")
+    require(epoch < self.proposals[proposal_id].deadline, "voting ended")
+    require(self.votes[proposal_id][caller] == 0, "already voted")
+    require(choice >= 1, "invalid choice")
+    require(choice <= 3, "invalid choice")
+    self.votes[proposal_id][caller] = choice
+    if choice == VoteChoice.Approve {
+      self.proposals[proposal_id].votes_for += 1
+    }
+    if choice == VoteChoice.Reject {
+      self.proposals[proposal_id].votes_against += 1
+    }
+    emit Voted(proposal_id, caller, choice)
+    return true
+  }
+
+  fn execute_proposal(proposal_id: int): bool {
+    require(proposal_id >= 0, "invalid id")
+    require(proposal_id < self.proposal_count, "proposal not found")
+    require(self.proposals[proposal_id].executed == 0, "already executed")
+    require(epoch >= self.proposals[proposal_id].deadline, "voting active")
+    let vf = self.proposals[proposal_id].votes_for
+    let va = self.proposals[proposal_id].votes_against
+    require(vf > va, "proposal rejected")
+    require(vf >= self.governance_threshold, "below threshold")
+    let ptype = self.proposals[proposal_id].proposal_type
+    let mid = self.proposals[proposal_id].model_id
+    let pa = self.proposals[proposal_id].param_a
+    let pb = self.proposals[proposal_id].param_b
+    if ptype == ProposalType.UpdateWeights {
+      require(mid >= 0, "invalid model")
+      require(mid < self.model_count, "model not found")
+      require(self.models[mid].status != ModelStatus.Locked, "model locked")
+      self.weights[mid][pa] = pb
+      emit WeightUpdated(mid, pa, pb)
+    }
+    if ptype == ProposalType.UpdateBias {
+      require(mid >= 0, "invalid model")
+      require(mid < self.model_count, "model not found")
+      require(self.models[mid].status != ModelStatus.Locked, "model locked")
+      self.models[mid].bias = pa
+    }
+    if ptype == ProposalType.SetThreshold {
+      require(pa > 0, "zero threshold")
+      self.governance_threshold = pa
+    }
+    if ptype == ProposalType.WithdrawFees {
+      require(pa > 0, "zero amount")
+      require(self.treasury >= pa, "insufficient treasury")
+      self.treasury -= pa
+      require(transfer(self.owner, pa), "transfer failed")
+      emit FeesWithdrawn(self.owner, pa)
+    }
+    self.proposals[proposal_id].executed = 1
+    emit ProposalExecuted(proposal_id, ptype)
+    return true
+  }
+
+  fn withdraw_fees(amount: int): bool {
+    require(caller == self.owner, "not owner")
+    require(amount > 0, "zero amount")
+    require(self.treasury >= amount, "insufficient treasury")
+    self.treasury -= amount
+    require(transfer(caller, amount), "transfer failed")
+    emit FeesWithdrawn(caller, amount)
+    return true
+  }
+
+  fn safe_withdraw(amount: int): bool {
+    require(caller == self.owner, "not owner")
+    require(amount > 0, "zero amount")
+    require(self.treasury >= amount, "insufficient treasury")
+    checkpoint()
+    self.treasury -= amount
+    let ok = transfer(caller, amount)
+    if !ok {
+      rollback()
+      return false
+    }
+    commit()
+    emit FeesWithdrawn(caller, amount)
+    return true
+  }
+
+  fn set_min_fee(fee: int): bool {
+    require(caller == self.owner, "not owner")
+    require(fee >= 0, "negative fee")
+    self.min_fee = fee
+    return true
+  }
+
+  fn set_discount_threshold(threshold: int): bool {
+    require(caller == self.owner, "not owner")
+    require(threshold > 0, "zero threshold")
+    self.fee_discount_threshold = threshold
+    return true
+  }
+
+  fn set_governance_threshold(t: int): bool {
+    require(caller == self.owner, "not owner")
+    require(t > 0, "zero threshold")
+    self.governance_threshold = t
+    return true
+  }
+
+  view fn get_model_info(id: int): string {
+    let s = to_string(self.models[id].num_features)
+    s = concat(s, ",")
+    s = concat(s, to_string(self.models[id].bias))
+    s = concat(s, ",")
+    s = concat(s, to_string(self.models[id].total_predictions))
+    s = concat(s, ",")
+    s = concat(s, to_string(self.models[id].status))
+    s = concat(s, ",")
+    s = concat(s, to_string(self.models[id].accuracy))
+    s = concat(s, ",")
+    s = concat(s, to_string(self.models[id].version))
+    s = concat(s, ",")
+    s = concat(s, to_string(self.models[id].fee_per_query))
+    return s
+  }
+
+  view fn get_user_info(addr: address): string {
+    let s = to_string(self.users[addr].total_queries)
+    s = concat(s, ",")
+    s = concat(s, to_string(self.users[addr].total_spent))
+    s = concat(s, ",")
+    s = concat(s, to_string(self.users[addr].reputation))
+    s = concat(s, ",")
+    s = concat(s, to_string(self.users[addr].last_query_epoch))
+    return s
+  }
+
+  view fn get_proposal_info(id: int): string {
+    let s = to_string(self.proposals[id].proposal_type)
+    s = concat(s, ",")
+    s = concat(s, to_string(self.proposals[id].model_id))
+    s = concat(s, ",")
+    s = concat(s, to_string(self.proposals[id].param_a))
+    s = concat(s, ",")
+    s = concat(s, to_string(self.proposals[id].param_b))
+    s = concat(s, ",")
+    s = concat(s, to_string(self.proposals[id].votes_for))
+    s = concat(s, ",")
+    s = concat(s, to_string(self.proposals[id].votes_against))
+    s = concat(s, ",")
+    s = concat(s, to_string(self.proposals[id].deadline))
+    return s
+  }
+
+  view fn get_weight(model_id: int, idx: int): int {
+    return self.weights[model_id][idx]
+  }
+
+  view fn get_stats(): string {
+    let s = to_string(self.model_count)
+    s = concat(s, ",")
+    s = concat(s, to_string(self.active_model))
+    s = concat(s, ",")
+    s = concat(s, to_string(self.total_predictions))
+    s = concat(s, ",")
+    s = concat(s, to_string(self.total_private_predictions))
+    s = concat(s, ",")
+    s = concat(s, to_string(self.total_revenue))
+    s = concat(s, ",")
+    s = concat(s, to_string(self.treasury))
+    s = concat(s, ",")
+    s = concat(s, to_string(self.proposal_count))
+    return s
+  }
+
+  view fn get_active_model(): int {
+    return self.active_model
+  }
+
+  view fn get_model_count(): int {
+    return self.model_count
+  }
+
+  view fn get_name(): string {
+    return self.name
+  }
+
+  view fn get_owner(): address {
+    return self.owner
+  }
+
+  view fn get_treasury(): int {
+    return self.treasury
+  }
+
+  view fn get_epoch_queries(e: int): int {
+    return self.epoch_queries[e]
+  }
+
+  view fn get_model_bias(model_id: int): int {
+    return self.models[model_id].bias
+  }
+
+  view fn get_model_status(model_id: int): int {
+    return self.models[model_id].status
+  }
+
+  view fn get_model_features(model_id: int): int {
+    return self.models[model_id].num_features
+  }
+
+  view fn get_model_version(model_id: int): int {
+    return self.models[model_id].version
+  }
+
+  view fn get_model_predictions(model_id: int): int {
+    return self.models[model_id].total_predictions
+  }
+
+  view fn get_governance_threshold(): int {
+    return self.governance_threshold
+  }
+
+  view fn get_proposal_count(): int {
+    return self.proposal_count
+  }
+}
